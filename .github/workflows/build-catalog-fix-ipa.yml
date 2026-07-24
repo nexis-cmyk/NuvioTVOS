@@ -1,0 +1,60 @@
+name: Build catalog fix IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source and player submodule
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install tvOS workspace dependencies
+        run: pod install --project-directory=tvosApp
+
+      - name: Run 200-catalog regression test
+        run: |
+          xcodebuild test \
+            -workspace tvosApp/NuvioTV.xcworkspace \
+            -scheme NuvioTV \
+            -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=latest' \
+            -only-testing:NuvioTVTests/PerformanceTests/testBoundedLoaderHandlesTwoHundredCatalogsInOrder
+
+      - name: Build unsigned tvOS app
+        run: |
+          xcodebuild build \
+            -workspace tvosApp/NuvioTV.xcworkspace \
+            -scheme NuvioTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$RUNNER_TEMP/NuvioDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/NuvioDerivedData/Build/Products/Release-appletvos/NuvioTV.app"
+          test -d "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/NuvioIPA/Payload"
+          ditto "$APP_PATH" "$RUNNER_TEMP/NuvioIPA/Payload/NuvioTV.app"
+          (
+            cd "$RUNNER_TEMP/NuvioIPA"
+            zip -qry "$GITHUB_WORKSPACE/NuvioTV-3.1.6-catalog-fix-unsigned.ipa" Payload
+          )
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: NuvioTV-3.1.6-catalog-fix-unsigned
+          path: NuvioTV-3.1.6-catalog-fix-unsigned.ipa
+          if-no-files-found: error
