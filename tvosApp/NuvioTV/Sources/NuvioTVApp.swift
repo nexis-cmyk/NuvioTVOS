@@ -1488,12 +1488,6 @@ private struct TVMainTabView: View {
         if #available(tvOS 27.0, *) {
             tabs
                 .tabViewStyle(.sidebarAdaptable)
-                .tabViewSidebarHeader {
-                    TVSidebarProfileHeader(
-                        profile: displayedProfile,
-                        action: onSwitchProfile
-                    )
-                }
         } else if #available(tvOS 18.0, *) {
             tabs
                 .tabViewStyle(.sidebarAdaptable)
