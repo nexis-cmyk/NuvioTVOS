@@ -45,6 +45,22 @@ final class PerformanceTests: XCTestCase {
 
     // MARK: - Data Loading Performance
 
+    func testFlexibleStringArrayAcceptsStremioStringAndArrayShapes() throws {
+        let decoder = JSONDecoder()
+
+        let scalar = try decoder.decode(
+            FlexibleStringArray.self,
+            from: Data(#""Christopher Nolan""#.utf8)
+        )
+        XCTAssertEqual(scalar.values, ["Christopher Nolan"])
+
+        let array = try decoder.decode(
+            FlexibleStringArray.self,
+            from: Data(#"["Lana Wachowski","Lilly Wachowski"]"#.utf8)
+        )
+        XCTAssertEqual(array.values, ["Lana Wachowski", "Lilly Wachowski"])
+    }
+
 
     func testDetailsLoadingPerformance() {
         let viewModel = DetailsViewModel(repository: repository)
