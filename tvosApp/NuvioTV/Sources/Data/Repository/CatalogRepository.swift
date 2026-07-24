@@ -1350,9 +1350,9 @@ private struct CinemetaMeta: Decodable {
     let releaseInfo: String?
     let year: String?
     let runtime: String?
-    let cast: [String]?
-    let director: [String]?
-    let writer: [String]?
+    let cast: FlexibleStringArray?
+    let director: FlexibleStringArray?
+    let writer: FlexibleStringArray?
     let country: String?
     let released: String?
     let moviedbId: Int?
@@ -1384,9 +1384,9 @@ private struct CinemetaMeta: Decodable {
             rating: parsedImdbRating,
             releaseInfo: releaseInfo ?? year,
             runtime: runtime,
-            cast: cast,
-            director: director,
-            writer: writer,
+            cast: cast?.values,
+            director: director?.values,
+            writer: writer?.values,
             certification: nil,
             country: country,
             released: released,
@@ -1413,6 +1413,29 @@ private struct CinemetaMeta: Decodable {
         guard let source else { return nil }
         let digits = source.prefix(4)
         return Int(digits)
+    }
+}
+
+/// Stremio add-ons in the wild use both a JSON string and a JSON string array
+/// for people fields. Cinemeta normally sends arrays, while AIO Metadata sends
+/// `director` and `writer` as a single comma-separated string. Accepting both
+/// shapes keeps one non-standard optional field from invalidating the complete
+/// catalog response.
+struct FlexibleStringArray: Decodable {
+    let values: [String]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let array = try? container.decode([String].self) {
+            values = array
+            return
+        }
+        if let value = try? container.decode(String.self) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            values = trimmed.isEmpty ? [] : [trimmed]
+            return
+        }
+        values = []
     }
 }
 
