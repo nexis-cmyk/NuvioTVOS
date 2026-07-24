@@ -463,4 +463,45 @@ final class PerformanceTests: XCTestCase {
             _ = try? decoder.decode(Meta.self, from: json)
         }
     }
+
+    func testBoundedLoaderHandlesTwoHundredCatalogsInOrder() async {
+        let probe = CatalogLoadConcurrencyProbe()
+        let input = Array(0..<200)
+
+        let results = await BoundedConcurrentLoader.map(
+            input,
+            limit: 6,
+            operation: { value in
+                await probe.didStart()
+                try? await Task.sleep(nanoseconds: 2_000_000)
+                await probe.didFinish()
+                return value
+            }
+        )
+
+        let loaded = results.compactMap { $0 }
+        let peakConcurrency = await probe.peakConcurrency()
+
+        XCTAssertEqual(loaded, input)
+        XCTAssertLessThanOrEqual(peakConcurrency, 6)
+        XCTAssertGreaterThan(peakConcurrency, 1)
+    }
+}
+
+private actor CatalogLoadConcurrencyProbe {
+    private var active = 0
+    private var peak = 0
+
+    func didStart() {
+        active += 1
+        peak = max(peak, active)
+    }
+
+    func didFinish() {
+        active -= 1
+    }
+
+    func peakConcurrency() -> Int {
+        peak
+    }
 }
