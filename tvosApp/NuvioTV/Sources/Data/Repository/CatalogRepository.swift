@@ -8,6 +8,51 @@
 
 import Foundation
 
+/// Runs a large list of independent requests without flooding one add-on
+/// server. Results keep their input order even though completed rows can be
+/// reported progressively.
+enum BoundedConcurrentLoader {
+    static func map<Input, Output>(
+        _ inputs: [Input],
+        limit requestedLimit: Int,
+        operation: @escaping (Input) async -> Output?,
+        onResult: ((Int, Output?) -> Void)? = nil
+    ) async -> [Output?] {
+        guard !inputs.isEmpty else { return [] }
+
+        let limit = max(1, min(requestedLimit, inputs.count))
+        var results = Array<Output?>(repeating: nil, count: inputs.count)
+
+        await withTaskGroup(of: (Int, Output?).self) { group in
+            for index in 0..<limit {
+                let input = inputs[index]
+                group.addTask {
+                    (index, await operation(input))
+                }
+            }
+            var nextIndex = limit
+
+            for await (index, output) in group {
+                results[index] = output
+                onResult?(index, output)
+
+                if Task.isCancelled {
+                    group.cancelAll()
+                } else if nextIndex < inputs.count {
+                    let index = nextIndex
+                    let input = inputs[index]
+                    nextIndex += 1
+                    group.addTask {
+                        (index, await operation(input))
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+}
+
 /// Repository protocol for catalog operations
 protocol CatalogRepository {
     /// Get catalogs for home screen
@@ -169,6 +214,15 @@ struct StreamAddonPreference: Codable, Equatable {
 /// Live Cinemeta-backed catalog and metadata repository for the tvOS app.
 final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
+    // This personalized build shows only catalogs supplied by the user's
+    // configured add-ons. Cinemeta remains available for metadata lookups,
+    // search, and browsing, but its four generic rows do not occupy Home.
+    private static let showsBuiltInHomeCatalogs = false
+    private static let maxConcurrentHomeCatalogRequests = 6
+    private static let homeCatalogRetryDelays: [UInt64] = [
+        400_000_000,
+        1_200_000_000
+    ]
     private(set) var homeCatalogLoadWasPartial = false
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
@@ -239,12 +293,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
         onUpdate: (([NuvioCatalog]) -> Void)? = nil
     ) async throws -> [NuvioCatalog] {
         homeCatalogLoadWasPartial = false
-        let specs: [(id: String, name: String, type: String, catalogId: String)] = [
+        let builtInSpecs: [(id: String, name: String, type: String, catalogId: String)] = [
             ("movie_top", "Popular - Movies", "movie", "top"),
             ("series_top", "Popular - Series", "series", "top"),
             ("movie_rating", "Top Rated - Movies", "movie", "imdbRating"),
             ("series_rating", "Top Rated - Series", "series", "imdbRating")
         ]
+        let specs = Self.showsBuiltInHomeCatalogs ? builtInSpecs : []
 
         // Load the independent Cinemeta rows concurrently. Previously one
         // transient failure aborted the complete Home request, leaving the
@@ -340,6 +395,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
         try Task.checkCancellation()
         catalogs.append(contentsOf: addonResult.catalogs)
+        // The progressive callback publishes rows in completion order. Always
+        // finish with the complete, manifest-ordered tree so bufferingNewest(1)
+        // cannot leave Home on an intermediate snapshot.
+        onUpdate?(catalogs)
         homeCatalogLoadWasPartial = pages.contains(where: { $0 == nil }) || addonResult.hadFailures
         guard !catalogs.isEmpty else { throw URLError(.cannotLoadFromNetwork) }
         return catalogs
@@ -372,12 +431,24 @@ final class CinemetaCatalogRepository: CatalogRepository {
             guard manifest.id != Self.cinemetaAddonId else { continue }
 
             let base = manifestURL.deletingLastPathComponent()
-            let eligible = (manifest.catalogs ?? []).filter { catalog in
-                guard catalog.eligibleForHome else { return false }
-                guard !disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") else {
+            let manifestCatalogs = manifest.catalogs ?? []
+            var hiddenCount = 0
+            var unsupportedExtraCount = 0
+            var missingRequiredOptionCount = 0
+            let eligible = manifestCatalogs.filter { catalog in
+                guard catalog.eligibleForHome else {
+                    unsupportedExtraCount += 1
                     return false
                 }
-                return !catalog.requiresGenre || catalog.firstGenreOption != nil
+                guard !disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") else {
+                    hiddenCount += 1
+                    return false
+                }
+                guard !catalog.requiresGenre || catalog.firstGenreOption != nil else {
+                    missingRequiredOptionCount += 1
+                    return false
+                }
+                return true
             }
 
             func load(_ catalog: AddonManifestCatalog) async -> NuvioCatalog? {
@@ -411,40 +482,49 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 }
             }
 
-            // BetterPosters rejects/limits a burst of all 13 catalog requests
-            // on some Apple TV networks, so keep requests ordered and serial.
-            // Publish each success, then retry only this manifest's missing rows.
-            var loadedForManifest = 0
-            var missingForManifest: [AddonManifestCatalog] = []
-            for catalog in eligible {
-                guard !Task.isCancelled else { break }
-                if let loaded = await load(catalog) {
-                    catalogs.append(loaded)
-                    loadedForManifest += 1
-                    onCatalogLoaded?(loaded)
-                } else if !Task.isCancelled {
-                    missingForManifest.append(catalog)
+            func loadWithRetry(_ catalog: AddonManifestCatalog) async -> NuvioCatalog? {
+                for attempt in 0...Self.homeCatalogRetryDelays.count {
+                    guard !Task.isCancelled else { return nil }
+                    if let loaded = await load(catalog) {
+                        return loaded
+                    }
+                    guard attempt < Self.homeCatalogRetryDelays.count else { break }
+                    try? await Task.sleep(
+                        nanoseconds: Self.homeCatalogRetryDelays[attempt]
+                    )
                 }
+                return nil
             }
 
-            if !missingForManifest.isEmpty, !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 600_000_000)
-                var stillMissing: [AddonManifestCatalog] = []
-                for catalog in missingForManifest {
-                    guard !Task.isCancelled else { break }
-                    if let loaded = await load(catalog) {
-                        catalogs.append(loaded)
-                        loadedForManifest += 1
+            // Large manifests can expose hundreds of Home rows. Serial loading
+            // makes the tail take minutes, while unbounded task groups can
+            // overload the add-on or the Apple TV. Keep six requests in flight,
+            // retry transient failures twice, and retain manifest order.
+            let loadedRows = await BoundedConcurrentLoader.map(
+                eligible,
+                limit: Self.maxConcurrentHomeCatalogRequests,
+                operation: { catalog in
+                    await loadWithRetry(catalog)
+                },
+                onResult: { _, loaded in
+                    if let loaded {
                         onCatalogLoaded?(loaded)
-                    } else if !Task.isCancelled {
-                        stillMissing.append(catalog)
                     }
                 }
-                missingForManifest = stillMissing
-            }
+            )
+            let loadedCatalogs = loadedRows.compactMap { $0 }
+            catalogs.append(contentsOf: loadedCatalogs)
 
-            hadFailures = hadFailures || !missingForManifest.isEmpty
-            reports.append("\(manifest.id): \(loadedForManifest)/\(eligible.count), failed \(missingForManifest.count)")
+            let failedCount = eligible.count - loadedCatalogs.count
+            hadFailures = hadFailures || failedCount > 0
+            reports.append(
+                "\(manifest.id): \(loadedCatalogs.count)/\(eligible.count) eligible loaded"
+                    + ", \(manifestCatalogs.count) declared"
+                    + ", \(failedCount) failed"
+                    + ", \(hiddenCount) hidden"
+                    + ", \(unsupportedExtraCount) unsupported"
+                    + ", \(missingRequiredOptionCount) missing options"
+            )
         }
 
         Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
