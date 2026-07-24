@@ -20,26 +20,47 @@ jobs:
       - name: Install tvOS workspace dependencies
         run: pod install --project-directory=tvosApp
 
-      - name: Run 200-catalog regression test
+      - name: Run catalog regression tests
         run: |
-          xcodebuild test \
-            -workspace tvosApp/NuvioTV.xcworkspace \
-            -scheme NuvioTV \
-            -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=latest' \
-            -only-testing:NuvioTVTests/PerformanceTests/testBoundedLoaderHandlesTwoHundredCatalogsInOrder
+          for attempt in 1 2 3 4; do
+            if xcodebuild test \
+              -workspace tvosApp/NuvioTV.xcworkspace \
+              -scheme NuvioTV \
+              -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=latest' \
+              -only-testing:NuvioTVTests/PerformanceTests/testBoundedLoaderHandlesTwoHundredCatalogsInOrder \
+              -only-testing:NuvioTVTests/PerformanceTests/testFlexibleStringArrayAcceptsStremioStringAndArrayShapes
+            then
+              exit 0
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              exit 1
+            fi
+            echo "xcodebuild test attempt $attempt failed; retrying package resolution..."
+            sleep $((attempt * 20))
+          done
 
       - name: Build unsigned tvOS app
         run: |
-          xcodebuild build \
-            -workspace tvosApp/NuvioTV.xcworkspace \
-            -scheme NuvioTV \
-            -configuration Release \
-            -sdk appletvos \
-            -destination 'generic/platform=tvOS' \
-            -derivedDataPath "$RUNNER_TEMP/NuvioDerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=
+          for attempt in 1 2 3; do
+            if xcodebuild build \
+              -workspace tvosApp/NuvioTV.xcworkspace \
+              -scheme NuvioTV \
+              -configuration Release \
+              -sdk appletvos \
+              -destination 'generic/platform=tvOS' \
+              -derivedDataPath "$RUNNER_TEMP/NuvioDerivedData" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY=
+            then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "xcodebuild build attempt $attempt failed; retrying..."
+            sleep $((attempt * 20))
+          done
 
       - name: Package unsigned IPA
         run: |
